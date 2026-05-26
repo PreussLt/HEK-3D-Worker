@@ -1,0 +1,1 @@
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS logo_color VARCHAR(7) DEFAULT '#ffffff';
