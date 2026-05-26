@@ -1,14 +1,25 @@
 import { ModelViewer } from '@app/viewer';
 import * as THREE from 'three';
 
+// Rotation matrices for each print direction (applied to already-centered viewer geometry)
+const _PRINT_DIR_MATRICES = {
+    flip_z: new THREE.Matrix4().makeRotationX(Math.PI),
+    x_pos:  new THREE.Matrix4().makeRotationY(-Math.PI / 2),
+    x_neg:  new THREE.Matrix4().makeRotationY( Math.PI / 2),
+    y_pos:  new THREE.Matrix4().makeRotationX(-Math.PI / 2),
+    y_neg:  new THREE.Matrix4().makeRotationX( Math.PI / 2),
+};
+
 export class LogoEditor extends ModelViewer {
     constructor(canvas, opts = {}) {
         super(canvas, { background: 0x111827, ...opts });
 
-        this._layers   = new Map();  // id → { mesh, tex, aspect, placement, color }
-        this._activeId = null;
-        this.onLayerPlaced = null;   // callback(id)
-        this._mouseStart = null;
+        this._layers              = new Map();  // id → { mesh, tex, aspect, placement, color }
+        this._activeId            = null;
+        this.onLayerPlaced        = null;   // callback(id)
+        this._mouseStart          = null;
+        this._printDirMatrix      = null;   // current rotation applied to viewer geometry
+        this._printDirKey         = 'none';
 
         canvas.style.cursor = 'crosshair';
         canvas.addEventListener('mousedown', e => { this._mouseStart = [e.clientX, e.clientY]; });
@@ -103,6 +114,47 @@ export class LogoEditor extends ModelViewer {
             rotation,
             viewer_transform: this._meshTransform ?? null,
         };
+    }
+
+    // ── Print direction ────────────────────────────────────────────────────────
+
+    /** Rotate the displayed model geometry. viewer_transform stays unchanged so
+     *  the worker's coordinate conversion remains valid. Returns true if any
+     *  placed layers were cleared (caller should warn the user). */
+    setPrintDirection(direction) {
+        // Undo current rotation first
+        if (this._printDirMatrix) {
+            const inv = this._printDirMatrix.clone().invert();
+            this._rotateViewerGeometry(inv);
+        }
+
+        this._printDirKey    = direction || 'none';
+        this._printDirMatrix = _PRINT_DIR_MATRICES[this._printDirKey] ?? null;
+
+        if (this._printDirMatrix) {
+            this._rotateViewerGeometry(this._printDirMatrix);
+        }
+
+        // Clear placements — they are now invalid
+        let hadPlaced = false;
+        for (const layer of this._layers.values()) {
+            if (layer.placement.position) {
+                hadPlaced = true;
+                layer.placement.position = null;
+                layer.placement.normal   = null;
+                if (layer.mesh) layer.mesh.visible = false;
+            }
+        }
+        return hadPlaced;
+    }
+
+    get printDirection() { return this._printDirKey; }
+
+    _rotateViewerGeometry(matrix) {
+        if (!this.mesh) return;
+        this.mesh.traverse(o => {
+            if (o.isMesh && o.geometry) o.geometry.applyMatrix4(matrix);
+        });
     }
 
     // ── Backward-compat single-layer API ───────────────────────────────────────

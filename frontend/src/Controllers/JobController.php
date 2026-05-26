@@ -143,12 +143,18 @@ class JobController
         $brimWidth    = max(0,  min(20, (float)($_POST['brim_width']    ?? 5)));
         $layerHeight  = in_array($_POST['layer_height'] ?? '', ['0.10','0.15','0.20','0.25','0.30'])
             ? (float)$_POST['layer_height'] : 0.20;
+        $printDirection = in_array($_POST['print_direction'] ?? '', ['none','flip_z','x_pos','x_neg','y_pos','y_neg'])
+            ? $_POST['print_direction'] : 'none';
+
+        $detailFix = isset($_POST['detail_fix']) && $_POST['detail_fix'] === '1';
 
         $printSettings = json_encode([
-            'support_mode'  => $supportMode,
-            'support_angle' => $supportAngle,
-            'brim_width'    => $brimWidth,
-            'layer_height'  => $layerHeight,
+            'support_mode'    => $supportMode,
+            'support_angle'   => $supportAngle,
+            'brim_width'      => $brimWidth,
+            'layer_height'    => $layerHeight,
+            'print_direction' => $printDirection,
+            'detail_fix'      => $detailFix,
         ]);
 
         $jobId = $this->db->createJob(

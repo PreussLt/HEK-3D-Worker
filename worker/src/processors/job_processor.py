@@ -12,7 +12,8 @@ import psycopg2
 import boto3
 from PIL import Image
 import trimesh
-from scipy.ndimage import gaussian_filter
+import trimesh.transformations as tft
+from scipy.ndimage import gaussian_filter, binary_dilation, binary_closing
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -304,6 +305,8 @@ class JobProcessor:
     ) -> None:
         ps         = print_settings or {}
         mesh       = self._load_mesh(model_path, ext, plate_index, filter_objects)
+        self._apply_print_direction(mesh, ps.get("print_direction", "none"))
+        detail_fix = bool(ps.get("detail_fix", False))
         logo_fills = []  # list of (trimesh.Trimesh, color_hex)
 
         if layers:
@@ -326,7 +329,7 @@ class JobProcessor:
                     log.info(f"Layer {i}: pos={[round(v,2) for v in real_p['position']]}, "
                              f"size={real_p['size']:.2f}, color={layer_color}")
 
-                    fill = self._raycast_logo_onto_surface(layer_logo_path, mesh, real_p)
+                    fill = self._raycast_logo_onto_surface(layer_logo_path, mesh, real_p, detail_fix)
                     if fill is not None:
                         log.info(f"Layer {i}: {len(fill.vertices)} verts, {len(fill.faces)} faces")
                         logo_fills.append((fill, layer_color))
@@ -341,7 +344,7 @@ class JobProcessor:
             log.info(f"Placement mm: pos={[round(v,2) for v in real_p['position']]}, "
                      f"size={real_p['size']:.2f}, normal={[round(v,3) for v in real_p['normal']]}")
 
-            fill = self._raycast_logo_onto_surface(logo_path, mesh, real_p)
+            fill = self._raycast_logo_onto_surface(logo_path, mesh, real_p, detail_fix)
             if fill is not None:
                 log.info(f"Logo fill: {len(fill.vertices)} verts, {len(fill.faces)} faces")
                 logo_fills.append((fill, logo_color))
@@ -363,6 +366,64 @@ class JobProcessor:
         self._write_3mf(out_path, mesh, logo_fills, model_color,
                         support_mesh=support_mesh, brim_mesh=brim_mesh,
                         layer_height=float(ps.get("layer_height", 0.2)))
+
+    # ── Print direction rotation ──────────────────────────────────────────────
+
+    _PRINT_DIRECTION_ROTATIONS = {
+        "flip_z": (np.pi,      [1, 0, 0]),
+        "x_pos":  (-np.pi/2,   [0, 1, 0]),
+        "x_neg":  ( np.pi/2,   [0, 1, 0]),
+        "y_pos":  (-np.pi/2,   [1, 0, 0]),
+        "y_neg":  ( np.pi/2,   [1, 0, 0]),
+    }
+
+    def _apply_print_direction(self, mesh: trimesh.Trimesh, direction: str) -> None:
+        """Rotate the mesh in-place around its bounding-box centre.
+        The viewer applies the same rotation so viewer-space placements remain valid.
+        """
+        if not direction or direction == "none":
+            return
+        spec = self._PRINT_DIRECTION_ROTATIONS.get(direction)
+        if spec is None:
+            log.warning(f"Unknown print_direction '{direction}', ignored.")
+            return
+        angle, axis = spec
+        center = mesh.bounding_box.centroid
+        R = tft.rotation_matrix(angle, axis, point=center)
+        mesh.apply_transform(R)
+        log.info(f"Print direction '{direction}': rotated {np.degrees(angle):.0f}° around {axis}")
+
+    # ── Manifold repair ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _repair_to_manifold(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+        """Make the logo-inlay mesh watertight using manifold3d (fixes Bambu error 9140)."""
+        mesh.merge_vertices(digits_vertex=4)
+        try:
+            import manifold3d as m3d
+            m = m3d.Manifold(
+                mesh=m3d.Mesh(
+                    vert_properties=mesh.vertices.astype(np.float32),
+                    tri_verts=mesh.faces.astype(np.uint32),
+                )
+            )
+            out = m.to_mesh()
+            if len(out.tri_verts) == 0:
+                raise ValueError("manifold3d returned empty mesh — input was non-manifold")
+            verts = np.array(out.vert_properties, dtype=float)
+            if verts.ndim == 2 and verts.shape[1] > 3:
+                verts = verts[:, :3]
+            return trimesh.Trimesh(
+                vertices=verts,
+                faces=np.array(out.tri_verts, dtype=int),
+                process=False,
+            )
+        except Exception as exc:
+            log.warning(f"manifold3d repair failed ({exc}), using trimesh fallback")
+            trimesh.repair.fix_winding(mesh)
+            trimesh.repair.fix_normals(mesh)
+            trimesh.repair.fill_holes(mesh)
+            return mesh
 
     # ── Coordinate transform ──────────────────────────────────────────────────
 
@@ -493,7 +554,8 @@ class JobProcessor:
     # ── Logo surface projection (raycasting) ─────────────────────────────────
 
     def _raycast_logo_onto_surface(
-        self, logo_path: str, mesh: trimesh.Trimesh, placement: dict
+        self, logo_path: str, mesh: trimesh.Trimesh, placement: dict,
+        detail_fix: bool = False,
     ) -> "trimesh.Trimesh | None":
         """
         Projects the logo onto the mesh surface and extrudes it INTO the body as a
@@ -563,6 +625,20 @@ class JobProcessor:
             return None
         filled_cells: set[tuple[int, int]] = set(zip(cols.tolist(), rows.tolist()))  # (ix, iy)
 
+        if detail_fix:
+            # Morphological closing: fills enclosed voids narrower than one nozzle diameter
+            # (≈ 0.4 mm) so the slicer doesn't skip thin logo details.
+            # closing = dilate then erode → outer boundary stays roughly unchanged.
+            cell_mm  = size / RES
+            morph_r  = max(1, int(np.ceil(0.4 / cell_mm / 2)))
+            alpha_mask = np.zeros((RES, RES), dtype=bool)
+            for (cx, cy) in filled_cells:
+                if 0 <= cy < RES and 0 <= cx < RES:
+                    alpha_mask[cy, cx] = True
+            alpha_mask = binary_closing(alpha_mask, iterations=morph_r)
+            rows, cols = np.where(alpha_mask)
+            filled_cells = set(zip(cols.tolist(), rows.tolist()))
+
         # 2. Unique corners
         needed: set[tuple[int, int]] = set()
         for (ix, iy) in filled_cells:
@@ -608,23 +684,25 @@ class JobProcessor:
 
         faces: list[list[int]] = []
 
-        # 5. Top cap
+        # 5. Top cap  — outward normal = +normal
+        # cross(c11-c00, c10-c00) = cross(t-b, t) = +normal  ✓
         for (ix, iy) in filled_cells:
             c00 = top_verts.get((ix,   iy));  c10 = top_verts.get((ix+1, iy))
             c01 = top_verts.get((ix,   iy+1)); c11 = top_verts.get((ix+1, iy+1))
             if c00 is not None and c10 is not None and c11 is not None:
-                faces.append([c00, c10, c11])
+                faces.append([c00, c11, c10])
             if c00 is not None and c11 is not None and c01 is not None:
-                faces.append([c00, c11, c01])
+                faces.append([c00, c01, c11])
 
-        # 6. Bottom cap (reversed winding)
+        # 6. Bottom cap — outward normal = -normal
+        # cross(c10-c00, c11-c00) = cross(t, t-b) = -normal  ✓
         for (ix, iy) in filled_cells:
             c00 = bot_verts.get((ix,   iy));  c10 = bot_verts.get((ix+1, iy))
             c01 = bot_verts.get((ix,   iy+1)); c11 = bot_verts.get((ix+1, iy+1))
             if c00 is not None and c10 is not None and c11 is not None:
-                faces.append([c00, c11, c10])
+                faces.append([c00, c10, c11])
             if c00 is not None and c11 is not None and c01 is not None:
-                faces.append([c00, c01, c11])
+                faces.append([c00, c11, c01])
 
         # 7. Side walls at boundary
         def _wall(ta, tb, ba, bb, flip: bool) -> None:
@@ -644,10 +722,10 @@ class JobProcessor:
                       bot_verts.get((ix, iy)),     bot_verts.get((ix, iy+1)),   True)
             if (ix, iy-1) not in filled_cells:
                 _wall(top_verts.get((ix,   iy)),   top_verts.get((ix+1, iy)),
-                      bot_verts.get((ix,   iy)),   bot_verts.get((ix+1, iy)),   True)
+                      bot_verts.get((ix,   iy)),   bot_verts.get((ix+1, iy)),   False)
             if (ix, iy+1) not in filled_cells:
                 _wall(top_verts.get((ix,   iy+1)), top_verts.get((ix+1, iy+1)),
-                      bot_verts.get((ix,   iy+1)), bot_verts.get((ix+1, iy+1)), False)
+                      bot_verts.get((ix,   iy+1)), bot_verts.get((ix+1, iy+1)), True)
 
         if not faces:
             return None
@@ -659,9 +737,10 @@ class JobProcessor:
         )
 
         # Taubin smoothing rounds the staircase pixel corners into smooth curves.
-        # 15 iterations gives visibly smooth edges; Taubin avoids shrinkage better
-        # than pure Laplacian smoothing.
         trimesh.smoothing.filter_taubin(result, iterations=15)
+
+        # Repair to manifold so Bambu Studio / PrusaSlicer accept the mesh (no error 9140).
+        result = self._repair_to_manifold(result)
         return result
 
     # ── Support generation ────────────────────────────────────────────────────

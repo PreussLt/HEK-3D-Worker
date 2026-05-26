@@ -295,8 +295,22 @@ $templateData = $templateData ?? null;
             <div style="display:flex;flex-direction:column;gap:.75rem;">
 
                 <div class="ctrl-group" style="gap:.35rem;">
+                    <span class="ctrl-label" style="color:#94a3b8;font-size:.8rem;font-weight:700;">Druckrichtung</span>
+                    <select id="f-print-direction" form="job-form" name="print_direction"
+                            style="width:100%;background:#111827;border:1px solid #374151;
+                                   border-radius:6px;color:#e2e8f0;padding:.4rem .7rem;font-size:.85rem;">
+                        <option value="none">Standard (Z+ oben)</option>
+                        <option value="flip_z">Umdrehen (Z- oben)</option>
+                        <option value="x_pos">Auf rechter Seite (+X unten)</option>
+                        <option value="x_neg">Auf linker Seite (-X unten)</option>
+                        <option value="y_pos">Auf Vorderseite (+Y unten)</option>
+                        <option value="y_neg">Auf Rückseite (-Y unten)</option>
+                    </select>
+                </div>
+
+                <div class="ctrl-group" style="gap:.35rem;">
                     <span class="ctrl-label" style="color:#94a3b8;font-size:.8rem;font-weight:700;">Stützen</span>
-                    <select name="support_mode" id="f-support-mode"
+                    <select name="support_mode" id="f-support-mode" form="job-form"
                             style="width:100%;background:#111827;border:1px solid #374151;
                                    border-radius:6px;color:#e2e8f0;padding:.4rem .7rem;font-size:.85rem;">
                         <option value="none">Keine</option>
@@ -309,13 +323,13 @@ $templateData = $templateData ?? null;
                     <span style="font-size:.8rem;font-weight:700;color:#94a3b8;display:flex;justify-content:space-between;">
                         Stützenwinkel <span id="angle-val">45</span>°
                     </span>
-                    <input type="range" name="support_angle" id="f-support-angle"
+                    <input type="range" name="support_angle" id="f-support-angle" form="job-form"
                            min="20" max="70" step="5" value="45">
                 </div>
 
                 <div class="ctrl-group" style="gap:.35rem;">
                     <span class="ctrl-label" style="color:#94a3b8;font-size:.8rem;font-weight:700;">Brim-Breite</span>
-                    <select name="brim_width" id="f-brim-width"
+                    <select name="brim_width" id="f-brim-width" form="job-form"
                             style="width:100%;background:#111827;border:1px solid #374151;
                                    border-radius:6px;color:#e2e8f0;padding:.4rem .7rem;font-size:.85rem;">
                         <option value="0">Kein Brim</option>
@@ -327,7 +341,7 @@ $templateData = $templateData ?? null;
 
                 <div class="ctrl-group" style="gap:.35rem;">
                     <span class="ctrl-label" style="color:#94a3b8;font-size:.8rem;font-weight:700;">Schichthöhe</span>
-                    <select name="layer_height" id="f-layer-height"
+                    <select name="layer_height" id="f-layer-height" form="job-form"
                             style="width:100%;background:#111827;border:1px solid #374151;
                                    border-radius:6px;color:#e2e8f0;padding:.4rem .7rem;font-size:.85rem;">
                         <option value="0.10">0.10 mm (Fein)</option>
@@ -335,6 +349,15 @@ $templateData = $templateData ?? null;
                         <option value="0.30">0.30 mm (Schnell)</option>
                     </select>
                 </div>
+
+                <label style="display:flex;align-items:center;gap:.55rem;cursor:pointer;padding:.2rem 0;">
+                    <input type="checkbox" name="detail_fix" value="1" form="job-form"
+                           style="width:15px;height:15px;accent-color:#3b82f6;cursor:pointer;">
+                    <span style="font-size:.82rem;color:#cbd5e1;line-height:1.4;">
+                        Feine Details optimieren<br>
+                        <span style="color:#64748b;font-size:.75rem;">Schließt zu schmale Strukturen (&lt; 0,4 mm)</span>
+                    </span>
+                </label>
 
             </div>
         </div>
@@ -974,6 +997,19 @@ async function loadTemplateData() {
     renderLayerList();
     updateHints();
 }
+
+// ── Print direction ───────────────────────────────────────────────────────────
+document.getElementById('f-print-direction').addEventListener('change', function () {
+    if (!editor) return;
+    const hadPlaced = editor.setPrintDirection(this.value);
+    if (hadPlaced) {
+        for (const layer of layers.values()) layer.placed = false;
+        renderLayerList();
+        document.getElementById('placement-status').textContent =
+            'Druckrichtung geändert — Ebenen bitte neu platzieren.';
+        updateHints();
+    }
+});
 
 // ── Print settings controls ───────────────────────────────────────────────────
 document.getElementById('f-support-angle').addEventListener('input', function () {
